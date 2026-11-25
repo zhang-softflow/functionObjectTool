@@ -17,8 +17,8 @@ OpenFOAM（ESI 版、openfoam.com）には 130〜140 種類の functionObject �
 ## インストール
 
 ```bash
-git clone https://github.com/softflowjp/functionObjectTools.git
-cd functionObjectTools
+git clone https://github.com/zhang-softflow/functionObjectTool.git
+cd functionObjectTool
 ./install.sh            # ~/.claude/skills にスキルをリンクし、PATH 設定の1行を表示
 ./install.sh --bashrc   # ~/.bashrc に PATH を追記する場合（バックアップあり）
 ./install.sh --uninstall

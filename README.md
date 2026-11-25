@@ -17,8 +17,8 @@ OpenFOAM (ESI, openfoam.com) ships 130–140 function objects, and finding the m
 ## Installation
 
 ```bash
-git clone https://github.com/softflowjp/functionObjectTools.git
-cd functionObjectTools
+git clone https://github.com/zhang-softflow/functionObjectTool.git
+cd functionObjectTool
 ./install.sh            # link the skill into ~/.claude/skills and print the PATH line
 ./install.sh --bashrc   # append the PATH setting to ~/.bashrc (with backup)
 ./install.sh --uninstall
