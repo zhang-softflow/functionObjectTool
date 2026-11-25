@@ -1,0 +1,1031 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 foamFO contributors
+#
+# foamFO is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version. See the LICENSE file for details.
+"""
+foamFO - Browse, search and generate OpenFOAM function object entries.
+
+The database is built by parsing the doxygen header comments
+(Description / Usage / \\verbatim / \\table sections) of the OpenFOAM
+sources, plus the tutorials and the etc/caseDicts/postProcessing templates.
+
+Sub-commands:
+    build     Scan the sources and write the database
+    list      List function objects (optionally by group)
+    search    Full-text search in names and descriptions
+    show      Show description, example, parameters and references
+    example   Print real usage blocks taken from the tutorials
+    add       Write a ready-to-edit entry into <case>/system
+    html      Generate the stand-alone catalog.html
+
+Database lookup order:
+    1. $FOAMFO_DB
+    2. ${XDG_DATA_HOME:-~/.local/share}/foamFO/foDatabase-<version>.json,
+       where <version> is the basename of $WM_PROJECT_DIR (written by 'build')
+    3. foDatabase.json bundled next to this script
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import date
+from pathlib import Path
+
+__version__ = "1.0.0"
+
+TOOL_DIR = Path(__file__).resolve().parent
+BUNDLED_DB = TOOL_DIR / "foDatabase.json"
+HTML_FILE = TOOL_DIR / "catalog.html"
+HTML_TEMPLATE = TOOL_DIR / "catalog_template.html"
+
+# Directories that only contain build artefacts or copies of headers
+SKIP_DIRS = {"lnInclude", "platforms", "Make", "build"}
+
+# Headers that document entries inherited by most function objects
+BASE_HEADERS = [
+    "src/OpenFOAM/db/functionObjects/functionObject/functionObject.H",
+    "src/OpenFOAM/db/functionObjects/regionFunctionObject/regionFunctionObject.H",
+    "src/OpenFOAM/db/functionObjects/writeFile/writeFile.H",
+    "src/finiteVolume/functionObjects/fvMeshFunctionObject/fvMeshFunctionObject.H",
+    "src/functionObjects/field/fieldExpression/fieldExpression.H",
+    "src/functionObjects/field/fieldsExpression/fieldsExpression.H",
+    "src/finiteVolume/functionObjects/volRegion/volRegion.H",
+    "src/meshTools/functionObjects/timeFunctionObject/timeFunctionObject.H",
+    "src/OpenFOAM/db/functionObjects/stateFunctionObject/stateFunctionObject.H",
+    "src/OpenFOAM/db/functionObjects/timeControl/timeControlFunctionObject.H",
+]
+
+# Extra search keywords (common terms not always present in the headers)
+ALIASES = {
+    "forceCoeffs": "drag lift coefficient cd cl cm 抗力 揚力 係数",
+    "forces": "drag lift force moment torque 抗力 揚力 力 モーメント",
+    "surfaceFieldValue": "flow rate flux mass flow area average integrate patch 流量 面平均 断面",
+    "volFieldValue": "volume average integral 体積平均",
+    "solverInfo": "residual convergence 残差 収束",
+    "yPlus": "y+ wall distance 壁面",
+    "wallShearStress": "wall shear tau friction 壁面せん断",
+    "fieldAverage": "time average mean rms prime2mean 時間平均",
+    "fieldMinMax": "min max minimum maximum 最大 最小",
+    "probes": "probe point monitor sampling プローブ 点",
+    "sets": "line sample graph profile サンプリング 線",
+    "surfaces": "cutting plane iso surface slice 断面 等値面",
+    "CourantNo": "courant cfl クーラン",
+    "Q": "vortex vortices 渦",
+    "vorticity": "vortex curl 渦度",
+    "runTimeControl": "stop terminate convergence criteria 停止 終了",
+    "vtkWrite": "vtk paraview output 出力",
+    "writeObjects": "write field output 出力",
+    "heatTransferCoeff": "htc heat transfer 熱伝達",
+    "wallHeatFlux": "heat flux 熱流束",
+    "pressure": "total static coefficient cp 圧力",
+    "coded": "user code custom 自作",
+    "exprField": "expression formula 式",
+}
+
+SECTION_RE = re.compile(r"^([A-Z][A-Za-z ]{1,30})\s*$")
+TYPENAME_RE = re.compile(r'\bTypeName(?:NoDebug)?\s*\(\s*"([^"]+)"\s*\)')
+REGISTER_RE = re.compile(
+    r"addToRunTimeSelectionTable\s*\(\s*functionObject\s*,\s*([\w:<>, ]+?)\s*,\s*dictionary\s*\)"
+)
+GROUP_RE = re.compile(r"^\s*(grp\w*FunctionObjects)\s*$", re.M)
+TYPE_ENTRY_RE = re.compile(r"^\s*type\s+([\w:.]+)\s*;", re.M)
+LIBS_RE = re.compile(r"^\s*libs\s*\(([^)]*)\)\s*;", re.M)
+LINK_RE = re.compile(r"\\link\s+([\w.]+)\s+\\endlink")
+
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+def is_foam_root(path):
+    return path is not None and Path(path, "src", "OpenFOAM").is_dir()
+
+
+def project_dir(arg=None, required=True):
+    """Return the OpenFOAM source root directory (or None if not found).
+
+    Search order: explicit argument, $WM_PROJECT_DIR, two levels above this
+    script (when installed inside an OpenFOAM tree, e.g. <root>/myTools/foamFO).
+    """
+    if arg:
+        cands = [Path(arg)]
+    else:
+        cands = []
+        env = os.environ.get("WM_PROJECT_DIR")
+        if env:
+            cands.append(Path(env))
+        cands.append(TOOL_DIR.parent.parent)
+    for c_ in cands:
+        if is_foam_root(c_):
+            return c_.resolve()
+    if required:
+        sys.exit("Error: OpenFOAM source tree not found. Source the OpenFOAM "
+                 "environment (etc/bashrc) or use --src <OpenFOAM root>.")
+    return None
+
+
+def user_db_path(version):
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "foamFO" / f"foDatabase-{version}.json"
+
+
+def current_version():
+    env = os.environ.get("WM_PROJECT_DIR")
+    return Path(env).name if env else None
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def header_comment(text):
+    """Return the leading documentation comment block of a source file."""
+    m = re.search(r"\\\*-{5,}[-*]*\*/", text)
+    if not m:
+        return ""
+    block = text[: m.start()]
+    # Drop the OpenFOAM banner / licence part
+    idx = block.find("\nClass")
+    if idx < 0:
+        idx = block.find("\nDescription")
+    return block[idx + 1:] if idx >= 0 else block
+
+
+def split_sections(comment):
+    """Split a doxygen header comment into {SectionName: text}."""
+    sections = {}
+    current = None
+    buf = []
+    for line in comment.splitlines():
+        m = SECTION_RE.match(line)
+        if m and not line.startswith(" "):
+            if current:
+                sections[current] = "\n".join(buf)
+            current = m.group(1).strip()
+            buf = []
+        elif current:
+            buf.append(line)
+    if current:
+        sections[current] = "\n".join(buf)
+    return sections
+
+
+def dedent(text):
+    lines = text.splitlines()
+    ind = [len(l) - len(l.lstrip()) for l in lines if l.strip()]
+    cut = min(ind) if ind else 0
+    return "\n".join(l[cut:] for l in lines).strip("\n")
+
+
+def extract_verbatims(text):
+    """Return \\verbatim blocks; tolerate a missing \\endverbatim."""
+    out = []
+    parts = re.split(r"\\verbatim[ \t]*\n", text)
+    for part in parts[1:]:
+        end = part.find("\\endverbatim")
+        if end >= 0:
+            out.append(dedent(part[:end]))
+            continue
+        # Unterminated block: stop at the brace closing the first dictionary
+        lines = part.splitlines()
+        first = next((l for l in lines if l.strip()), "")
+        ind = len(first) - len(first.lstrip())
+        blk = []
+        for l in lines:
+            blk.append(l)
+            if l.strip() == "}" and len(l) - len(l.lstrip()) == ind:
+                break
+        out.append(dedent("\n".join(blk)))
+    return out
+
+
+def clean_doxygen(text):
+    """Remove doxygen markup from prose."""
+    text = re.sub(r"\\verbatim.*?\\endverbatim", "", text, flags=re.S)
+    text = re.sub(r"\\table.*?\\endtable", "", text, flags=re.S)
+    text = re.sub(r"<!--\s*\n\s*-->", " ", text)
+    text = LINK_RE.sub(r"\1", text)
+    text = re.sub(r"\\(c|a|b|em|p)\s+", "", text)
+    text = re.sub(r"\\vartheta", "theta", text)
+    text = re.sub(r"\\heading\s+", "", text)
+    text = re.sub(r"\\f\[.*?\\f\]", "[formula]", text, flags=re.S)
+    text = re.sub(r"\\f\$(.*?)\\f\$", r"\1", text, flags=re.S)
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    return dedent(text)
+
+
+def parse_tables(text):
+    """Parse every \\table ... \\endtable block into a list of row dicts."""
+    tables = []
+    for m in re.finditer(r"(?:\\heading\s+([^\n]*)\n\s*)?\\table\s*\n(.*?)\\endtable",
+                         text, re.S):
+        heading = (m.group(1) or "").strip()
+        body = re.sub(r"<!--\s*\n\s*-->", " ", m.group(2))
+        lines = [l.strip() for l in body.splitlines() if "|" in l]
+        if not lines:
+            continue
+        head = [c.strip().lower() for c in lines[0].split("|")]
+        cols = {}
+        for i, h in enumerate(head):
+            if h.startswith("prop") or h in ("entry", "keyword", "name"):
+                cols.setdefault("name", i)
+            elif h.startswith("desc"):
+                cols.setdefault("desc", i)
+            elif h.startswith("type"):
+                cols.setdefault("type", i)
+            elif h.startswith("req") or h.startswith("mand"):
+                cols.setdefault("reqd", i)
+            elif h.startswith("def"):
+                cols.setdefault("default", i)
+        if "name" not in cols:
+            continue
+        rows = []
+        for l in lines[1:]:
+            cells = [c.strip() for c in l.split("|")]
+
+            def cell(key):
+                i = cols.get(key)
+                return cells[i] if i is not None and i < len(cells) else ""
+            name = cell("name")
+            if not name:
+                continue
+            reqd = cell("reqd").lower()
+            rows.append({
+                "name": name,
+                "desc": re.sub(r"\s+", " ", LINK_RE.sub(r"\1", cell("desc"))),
+                "type": cell("type"),
+                "reqd": "yes" if reqd.startswith(("yes", "y")) else
+                        ("no" if reqd.startswith("no") else reqd),
+                "default": cell("default").strip("-").strip() if cell("default") != "-" else "",
+            })
+        if rows:
+            tables.append({"heading": heading, "rows": rows})
+    return tables
+
+
+def lib_from_make(header):
+    """Find the library a source belongs to via the nearest Make/files."""
+    d = Path(header).parent
+    for _ in range(8):
+        mf = d / "Make" / "files"
+        if mf.is_file():
+            m = re.search(r"^\s*LIB\s*=\s*\$\(FOAM_\w+\)/lib(\w+)", read_text(mf), re.M)
+            if m:
+                return m.group(1)
+            m = re.search(r"^\s*EXE\s*=", read_text(mf), re.M)
+            if m:
+                return ""
+        if d.parent == d:
+            break
+        d = d.parent
+    return ""
+
+
+def find_brace_block(lines, idx):
+    """Return (start, end) line indices of the dictionary enclosing lines[idx]."""
+    depth = 0
+    start = None
+    for i in range(idx, -1, -1):
+        s = re.sub(r"//.*", "", lines[i])
+        depth += s.count("}") - s.count("{")
+        if depth < 0:
+            start = i
+            break
+    if start is None:
+        return None
+    # Include the dictionary name when the brace is on its own line
+    if lines[start].strip() == "{" and start > 0 and lines[start - 1].strip():
+        start -= 1
+    depth = 0
+    for j in range(start, len(lines)):
+        s = re.sub(r"//.*", "", lines[j])
+        depth += s.count("{") - s.count("}")
+        if depth == 0 and "{" in "".join(lines[start:j + 1]):
+            return start, j
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Database build
+# ---------------------------------------------------------------------------
+
+def parse_header(root, hpath):
+    text = read_text(hpath)
+    comment = header_comment(text)
+    secs = split_sections(comment)
+    usage = secs.get("Usage", "")
+    desc_raw = secs.get("Description", "")
+    verbs = extract_verbatims(usage) + extract_verbatims(desc_raw)
+    tables = parse_tables(usage) + parse_tables(desc_raw)
+    # Fallback: documentation in the .C/.cxx file
+    if not verbs or not tables:
+        for ext in (".C", ".cxx"):
+            src = hpath.with_suffix(ext)
+            if src.is_file():
+                s2 = split_sections(header_comment(read_text(src)))
+                for key in ("Usage", "Description"):
+                    if not verbs:
+                        verbs = extract_verbatims(s2.get(key, ""))
+                    if not tables:
+                        tables = parse_tables(s2.get(key, ""))
+    inherited = sorted(set(LINK_RE.findall(usage + desc_raw)) - {hpath.name})
+    gm = GROUP_RE.search(secs.get("Group", "") + "\n" + comment)
+    see_also = clean_doxygen(secs.get("See also", ""))
+    notes = clean_doxygen(secs.get("Note", ""))
+    return {
+        "text": text,
+        "description": clean_doxygen(desc_raw),
+        "verbatims": verbs,
+        "tables": tables,
+        "inherited": [i for i in inherited if i.endswith(".H")],
+        "group": gm.group(1) if gm else "",
+        "seeAlso": see_also,
+        "note": notes,
+    }
+
+
+def pick_example(verbs, tname):
+    """Choose the verbatim block that is a usage example of 'tname'."""
+    for v in verbs:
+        if re.search(r"^\s*type\s+" + re.escape(tname) + r"\s*;", v, re.M):
+            return v
+    for v in verbs:
+        if TYPE_ENTRY_RE.search(v):
+            return v
+    return verbs[0] if verbs else ""
+
+
+def guess_group(rel):
+    parts = rel.split("/")
+    if parts[:2] == ["src", "functionObjects"] and len(parts) > 2:
+        return "grp" + parts[2][0].upper() + parts[2][1:] + "FunctionObjects"
+    return "grpOtherFunctionObjects"
+
+
+def scan_templates(root):
+    """Map function object type -> list of #includeFunc template names."""
+    base = root / "etc" / "caseDicts" / "postProcessing"
+    out = {}
+    if not base.is_dir():
+        return out
+    for f in sorted(base.rglob("*")):
+        if not f.is_file() or f.suffix == ".cfg":
+            continue
+        text = read_text(f)
+        seen = set()
+        tname = None
+        # Follow #includeEtc chain to find the type entry
+        while True:
+            # The function object type is the top-level (unindented) entry
+            m = re.search(r"^type\s+([\w:.]+)\s*;", re.sub(r"//.*", "", text), re.M)
+            if m:
+                tname = m.group(1)
+                break
+            inc = re.search(r'#includeEtc\s+"([^"]+)"', text)
+            if not inc or inc.group(1) in seen:
+                break
+            seen.add(inc.group(1))
+            text = read_text(root / "etc" / inc.group(1))
+        if tname:
+            out.setdefault(tname, []).append(str(f.relative_to(base)))
+    return out
+
+
+def scan_tutorials(root, names):
+    """Map function object type -> list of tutorial files using it."""
+    out = {}
+    tut = root / "tutorials"
+    if not tut.is_dir():
+        return out
+    for f in tut.rglob("*"):
+        if not f.is_file() or "system" not in f.parts:
+            continue
+        if f.stat().st_size > 400000:
+            continue
+        text = read_text(f)
+        for m in TYPE_ENTRY_RE.finditer(text):
+            t = m.group(1)
+            if t in names:
+                rel = str(f.relative_to(root))
+                lst = out.setdefault(t, [])
+                if rel not in lst:
+                    lst.append(rel)
+    for t in out:
+        out[t].sort()
+    return out
+
+
+def cmd_build(args):
+    root = project_dir(args.src)
+    print(f"Scanning {root} ...")
+
+    # (a) headers of classes registered as functionObject
+    candidates = {}
+    for d in ("src", "applications", "modules"):
+        if not (root / d).is_dir():
+            continue
+        for f in (root / d).rglob("*"):
+            if f.suffix not in (".C", ".cxx", ".H") or not f.is_file():
+                continue
+            # Skip build artefacts (lnInclude copies, platforms, Make)
+            if SKIP_DIRS.intersection(f.relative_to(root).parts):
+                continue
+            text = read_text(f)
+            if f.suffix in (".C", ".cxx") and REGISTER_RE.search(text):
+                h = f.with_suffix(".H")
+                if h.is_file() and TYPENAME_RE.search(read_text(h)):
+                    candidates[h] = "registered"
+                else:
+                    # Templated registration (e.g. xxxFunctionObjects.C):
+                    # mark the documented headers of the same directory
+                    for hh in sorted(f.parent.glob("*.H")):
+                        if TYPENAME_RE.search(read_text(hh)):
+                            candidates[hh] = "registered"
+            elif f.suffix == ".H" and GROUP_RE.search(header_comment(text)):
+                candidates.setdefault(f, "group")
+
+    entries = {}
+    for h, how in sorted(candidates.items()):
+        rel = str(h.relative_to(root))
+        info = parse_header(root, h)
+        names = TYPENAME_RE.findall(info["text"])
+        if not names:
+            continue
+        tname = names[0]
+        if rel.startswith("applications/test"):
+            continue
+        example = pick_example(info["verbatims"], tname)
+        # Classify: cloud functions, usable function objects, base classes
+        if "CloudFunctionObject" in rel or "lagrangian/intermediate" in rel:
+            kind = "cloudFunction"
+        elif how == "registered" or re.search(
+                r"^\s*type\s+" + re.escape(tname) + r"\s*;", example, re.M):
+            kind = "functionObject"
+        else:
+            kind = "base"
+        libs = []
+        lm = LIBS_RE.search(example)
+        if lm:
+            libs = [x.strip().strip('"') for x in lm.group(1).split()]
+        if not libs and kind == "functionObject":
+            lib = lib_from_make(h)
+            if lib:
+                libs = [lib]
+        desc = info["description"]
+        summary = desc.split("\n\n")[0].replace("\n", " ").strip()
+        e = {
+            "name": tname,
+            "kind": kind,
+            "registered": how == "registered",
+            "group": info["group"] or guess_group(rel),
+            "header": rel,
+            "libs": libs,
+            "summary": summary,
+            "description": desc,
+            "example": example,
+            "otherExamples": [v for v in info["verbatims"] if v != example][:4],
+            "tables": info["tables"],
+            "inherited": info["inherited"],
+            "note": info["note"],
+            "seeAlso": info["seeAlso"],
+        }
+        # Prefer registered entries on name clashes
+        old = entries.get(tname)
+        if old is None or (e["registered"] and not old["registered"]):
+            entries[tname] = e
+
+    templates = scan_templates(root)
+    tutorials = scan_tutorials(root, set(entries))
+    for n, e in entries.items():
+        e["includeFunc"] = templates.get(n, [])
+        e["tutorials"] = tutorials.get(n, [])
+        e["aliases"] = ALIASES.get(n, "")
+
+    # Base headers documenting inherited entries
+    bases = {}
+    for b in BASE_HEADERS:
+        p = root / b
+        if p.is_file():
+            info = parse_header(root, p)
+            bases[p.name] = {
+                "header": b,
+                "summary": info["description"].split("\n\n")[0].replace("\n", " "),
+                "tables": info["tables"],
+            }
+
+    db = {
+        "version": root.name,
+        "built": date.today().isoformat(),
+        "functionObjects": dict(sorted(entries.items(), key=lambda kv: kv[0].lower())),
+        "bases": bases,
+    }
+    out = Path(args.output) if args.output else user_db_path(root.name)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(db, indent=1, ensure_ascii=False), encoding="utf-8")
+
+    fo = [e for e in entries.values() if e["kind"] == "functionObject"]
+    noex = sorted(e["name"] for e in fo if not e["example"])
+    notab = sorted(e["name"] for e in fo if not e["tables"])
+    print(f"Wrote {out}")
+    if not args.output and current_version() != root.name:
+        print(f"  note: used automatically when $WM_PROJECT_DIR ends with '{root.name}';"
+              f" otherwise set FOAMFO_DB={out}")
+    print(f"  function objects : {len(fo)}")
+    print(f"  cloud functions  : {sum(1 for e in entries.values() if e['kind'] == 'cloudFunction')}")
+    print(f"  base classes     : {sum(1 for e in entries.values() if e['kind'] == 'base')}")
+    print(f"  with example     : {len(fo) - len(noex)}")
+    print(f"  with param table : {len(fo) - len(notab)}")
+    print(f"  with #includeFunc: {sum(1 for e in fo if e['includeFunc'])}")
+    print(f"  used in tutorials: {sum(1 for e in fo if e['tutorials'])}")
+    if args.verbose:
+        print("  no example    :", " ".join(noex) or "-")
+        print("  no param table:", " ".join(notab) or "-")
+
+
+# ---------------------------------------------------------------------------
+# Query commands
+# ---------------------------------------------------------------------------
+
+def find_db():
+    """Return the database path according to the lookup order."""
+    env = os.environ.get("FOAMFO_DB")
+    if env:
+        if not Path(env).is_file():
+            sys.exit(f"Error: FOAMFO_DB={env} not found.")
+        return Path(env)
+    ver = current_version()
+    if ver and user_db_path(ver).is_file():
+        return user_db_path(ver)
+    return BUNDLED_DB
+
+
+def load_db():
+    path = find_db()
+    if not path.is_file():
+        sys.exit("Error: database not found. Run 'foamFO build' first.")
+    db = json.loads(path.read_text(encoding="utf-8"))
+    ver = current_version()
+    if ver and path == BUNDLED_DB and db.get("version") != ver and not os.environ.get("FOAMFO_QUIET"):
+        print(f"Warning: bundled database is for {db.get('version')}, but the "
+              f"environment is {ver}. Run 'foamFO build' for an exact match.",
+              file=sys.stderr)
+    return db
+
+
+def use_color():
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(text, code):
+    return f"\033[{code}m{text}\033[0m" if use_color() else text
+
+
+def short_group(g):
+    return re.sub(r"^grp|FunctionObjects$", "", g) or "-"
+
+
+def lookup(db, name):
+    fos = db["functionObjects"]
+    if name in fos:
+        return fos[name]
+    low = {k.lower(): k for k in fos}
+    if name.lower() in low:
+        return fos[low[name.lower()]]
+    close = [k for k in fos if name.lower() in k.lower()]
+    msg = f"Error: unknown function object '{name}'."
+    if close:
+        msg += " Did you mean: " + ", ".join(close[:10]) + " ?"
+    sys.exit(msg)
+
+
+def print_rows(entries):
+    w = max([len(e["name"]) for e in entries] + [4])
+    for e in entries:
+        flag = "F" if e["includeFunc"] else " "
+        flag += "T" if e["tutorials"] else " "
+        s = e["summary"]
+        if len(s) > 80:
+            s = s[:77] + "..."
+        print(f"{c(e['name'].ljust(w), '1;36')}  {flag}  "
+              f"{short_group(e['group']):<16} {s}")
+
+
+def cmd_list(args):
+    db = load_db()
+    es = [e for e in db["functionObjects"].values()
+          if args.all or e["kind"] == "functionObject"]
+    if args.group:
+        es = [e for e in es if args.group.lower() in e["group"].lower()]
+    if args.groups:
+        cnt = {}
+        for e in es:
+            cnt[short_group(e["group"])] = cnt.get(short_group(e["group"]), 0) + 1
+        for g, n in sorted(cnt.items()):
+            print(f"{g:<24}{n}")
+        return
+    print_rows(es)
+    print(f"\n{len(es)} entries  (F: #includeFunc template, T: used in tutorials)")
+
+
+def cmd_search(args):
+    db = load_db()
+    words = [w.lower() for w in args.keywords]
+    hits = []
+    for e in db["functionObjects"].values():
+        if e["kind"] != "functionObject" and not args.all:
+            continue
+        hay_name = e["name"].lower()
+        hay = " ".join([e["name"], e["description"], e["header"], " ".join(e["includeFunc"]),
+                        e.get("aliases", ""),
+                        " ".join(r["name"] for t in e["tables"] for r in t["rows"])]).lower()
+        if all(w in hay for w in words):
+            score = sum(3 for w in words if w in hay_name) + \
+                sum(1 for w in words if w in e["summary"].lower()) + \
+                sum(2 for w in words if w in e.get("aliases", "").lower())
+            hits.append((-score, e["name"].lower(), e))
+    if not hits:
+        print("No match.")
+        return
+    print_rows([h[2] for h in sorted(hits)])
+
+
+def format_tables(e, only_required=False):
+    out = []
+    for t in e["tables"]:
+        rows = [r for r in t["rows"] if not only_required or r["reqd"] == "yes"]
+        if not rows:
+            continue
+        if t["heading"]:
+            out.append(c(f"  [{t['heading']}]", "1"))
+        wn = max(len(r["name"]) for r in rows)
+        wt = max([len(r["type"]) for r in rows] + [4])
+        out.append(f"  {'Property'.ljust(wn)}  {'Type'.ljust(wt)}  Reqd  Default        Description")
+        for r in rows:
+            name = r["name"].ljust(wn)
+            if r["reqd"] == "yes":
+                name = c(name, "1;31")
+            out.append(f"  {name}  {r['type'].ljust(wt)}  {r['reqd'][:4]:<4}  "
+                       f"{(r['default'] or '-')[:13]:<13}  {r['desc']}")
+    return "\n".join(out)
+
+
+def cmd_show(args):
+    db = load_db()
+    e = lookup(db, args.name)
+    print(c(f"=== {e['name']} ===", "1;36") +
+          f"   ({short_group(e['group'])}, {e['kind']})")
+    print(f"Header : {e['header']}")
+    if e["libs"]:
+        print(f"libs   : ({' '.join(e['libs'])})")
+    print()
+    print(c("Description", "1;33"))
+    print("\n".join("  " + l for l in (e["description"] or "-").splitlines()))
+    print()
+    print(c("Example (from header)", "1;33"))
+    print("\n".join("  " + l for l in (e["example"] or "(none)").splitlines()))
+    if args.more and e["otherExamples"]:
+        for v in e["otherExamples"]:
+            print()
+            print("\n".join("  " + l for l in v.splitlines()))
+    print()
+    if e["tables"]:
+        print(c("Parameters", "1;33") + "  (red = mandatory)")
+        print(format_tables(e))
+        print()
+    if e["inherited"]:
+        print(c("Inherited entries documented in", "1;33") + ": " + ", ".join(e["inherited"]))
+        if args.inherited:
+            for h in e["inherited"]:
+                b = db["bases"].get(h)
+                if b and b["tables"]:
+                    print(c(f"  --- {h} ---", "1"))
+                    print(format_tables(b))
+        else:
+            print("  (use --inherited to show them)")
+        print()
+    if e["note"]:
+        print(c("Note", "1;33"))
+        print("\n".join("  " + l for l in e["note"].splitlines()))
+        print()
+    if e["includeFunc"]:
+        print(c("Ready-made #includeFunc templates (etc/caseDicts/postProcessing)", "1;33"))
+        for t in e["includeFunc"]:
+            print(f"  #includeFunc {Path(t).name}      // {t}")
+        print("  (args without spaces, e.g. patchAverage(name=outlet,p,U); "
+              "unnamed args -> field/fields)")
+        print()
+    if e["tutorials"]:
+        n = len(e["tutorials"])
+        print(c(f"Used in tutorials ({n})", "1;33") + f"  -> foamFO example {e['name']}")
+        for t in e["tutorials"][: args.max]:
+            print("  " + t)
+        if n > args.max:
+            print(f"  ... {n - args.max} more")
+
+
+def cmd_example(args):
+    db = load_db()
+    e = lookup(db, args.name)
+    root = project_dir(args.src, required=False)
+    if not e["tutorials"]:
+        print(f"'{e['name']}' is not used in the tutorials. Header example:\n")
+        print(e["example"])
+        return
+    if root is None:
+        print("OpenFOAM tutorials not found (source the OpenFOAM environment or use "
+              "--src). Files using it:")
+        for rel in e["tutorials"][: args.max * 3]:
+            print("  " + rel)
+        return
+    shown = 0
+    for rel in e["tutorials"]:
+        if not (root / rel).is_file():
+            continue
+        lines = read_text(root / rel).splitlines()
+        for i, l in enumerate(lines):
+            m = TYPE_ENTRY_RE.match(l)
+            if not m or m.group(1) != e["name"]:
+                continue
+            blk = find_brace_block(lines, i)
+            if blk:
+                print(c(f"// ---- {rel}:{blk[0] + 1}", "1;32"))
+                print("\n".join(lines[blk[0]: blk[1] + 1]))
+            else:
+                print(c(f"// ---- {rel} (whole file)", "1;32"))
+                print("\n".join(lines))
+            print()
+            shown += 1
+            if shown >= args.max:
+                left = len(e["tutorials"])
+                print(f"(showed {shown}; {left} file(s) use it, use -m to show more)")
+                return
+
+
+# ---------------------------------------------------------------------------
+# Entry generation
+# ---------------------------------------------------------------------------
+
+def build_entry(e, entry_name, mode):
+    """Create a dictionary entry text from the header example."""
+    ex = e["example"]
+    if not ex:
+        ex = "{0}\n{{\n    type    {1};\n    libs    ({2});\n}}".format(
+            entry_name, e["name"], " ".join(e["libs"]))
+    lines = ex.splitlines()
+    # Rename the top-level dictionary
+    for i, l in enumerate(lines):
+        if l.strip() and not l.strip().startswith("//"):
+            if re.match(r"^[\w<>.\-]+\s*$", l.strip()):
+                lines[i] = entry_name
+            break
+    required = {r["name"] for t in e["tables"] for r in t["rows"] if r["reqd"] == "yes"}
+    # Locate the outer braces of the top-level dictionary
+    first = next((i for i, l in enumerate(lines) if l.strip() == "{"), None)
+    last = max((i for i, l in enumerate(lines) if l.strip() == "}"), default=None)
+    has_markers = any(l.strip().startswith("//") and "mandatory" in l.lower() for l in lines)
+    out = []
+    section = "mandatory"
+    depth = 0
+    for i, l in enumerate(lines):
+        s = l.strip()
+        low = s.lower()
+        if depth <= 1 and low.startswith("//"):
+            if "conditional" in low:
+                section = "conditional"
+            elif "optional" in low:
+                section = "optional"
+            elif "inherited" in low:
+                section = "inherited"
+            elif "mandatory" in low:
+                section = "mandatory"
+        nopen = s.count("{") - s.count("}") if not s.startswith("//") else 0
+        if s in ("...", "// ..."):
+            depth += nopen
+            continue
+        key = re.match(r"^([\w\-]+)\s", s + " ")
+        is_req = depth == 1 and bool(key) and key.group(1) in required and ";" in s
+        outer = first is None or i <= first or i == last
+        # Without section markers, treat nested dictionaries as optional
+        nested = False
+        if not has_markers and not outer:
+            nxt = next((x.strip() for x in lines[i + 1:] if x.strip()), "")
+            nested = depth >= 2 or nopen > 0 or \
+                (depth == 1 and re.match(r"^[\w<>\-]+$", s) is not None and nxt.startswith("{"))
+        if outer or (section == "mandatory" and not nested) or is_req:
+            out.append(l)
+        elif mode == "full":
+            if s and not s.startswith("//"):
+                out.append(re.sub(r"^(\s*)", r"\1// ", l, count=1))
+            else:
+                out.append(l)
+        depth += nopen
+    # Drop dangling comment headers / blank runs
+    clean = []
+    for l in out:
+        if not l.strip() and clean and not clean[-1].strip():
+            continue
+        clean.append(l)
+    if mode != "full":
+        clean = [l for j, l in enumerate(clean)
+                 if not (l.strip().startswith("//") and
+                         (j + 1 >= len(clean) or not clean[j + 1].strip()
+                          or clean[j + 1].strip() == "}"))]
+    out = [l for j, l in enumerate(clean)
+           if not (not l.strip() and j + 1 < len(clean) and clean[j + 1].strip() == "}")]
+    text = "\n".join(out)
+    # Ensure the libs entry exists
+    if e["libs"] and not LIBS_RE.search(text):
+        text = re.sub(r"(^\s*type\s+[\w:.]+\s*;[^\n]*\n)",
+                      r"\1    libs            (" + " ".join(e["libs"]) + ");\n",
+                      text, count=1, flags=re.M)
+    if mode == "full":
+        # Document optional parameters missing from the example
+        present = set(re.findall(r"^\s*(?://\s*)?(\w+)\s", text, re.M))
+        extra = [r for t in e["tables"] for r in t["rows"]
+                 if r["name"] not in present and re.match(r"^\w+$", r["name"])]
+        if extra:
+            add = ["", "    // Further entries documented in the header:"]
+            for r in extra:
+                d = f" (default: {r['default']})" if r["default"] else ""
+                add.append(f"    // {r['name']:<16} <{r['type'] or 'value'}>;  "
+                           f"// {r['desc']}{d}")
+            idx = text.rfind("}")
+            text = text[:idx].rstrip("\n") + "\n" + "\n".join(add) + "\n" + text[idx:]
+        text += ("\n\n// Common entries (functionObject.H): writeControl, writeInterval,"
+                 "\n// executeControl, executeInterval, timeStart, timeEnd, enabled, log")
+    return text
+
+
+def cmd_add(args):
+    db = load_db()
+    e = lookup(db, args.name)
+    case = Path(args.case).resolve()
+    sysdir = case / "system"
+    entry_name = args.entry or e["name"] + "1"
+    text = build_entry(e, entry_name, "full" if args.full else "minimal")
+    stamp = date.today().isoformat()
+    body = (f"// Generated by foamFO from {e['header']} ({stamp})\n"
+            f"// Include it inside controlDict 'functions {{ }}':  #include \"{entry_name}\"\n\n"
+            f"{text}\n")
+    placeholders = sorted(set(re.findall(r"<[\w ,:/|]+>", re.sub(r"//.*", "", text))))
+    if args.stdout:
+        print(body)
+    else:
+        if not sysdir.is_dir():
+            sys.exit(f"Error: {sysdir} does not exist (use -case)")
+        target = sysdir / entry_name
+        if target.exists() and not args.force:
+            sys.exit(f"Error: {target} exists (use -f to overwrite)")
+        target.write_text(body, encoding="utf-8")
+        print(f"Wrote {target}")
+        if args.insert:
+            insert_include(sysdir / "controlDict", entry_name)
+        else:
+            print(f"Add to controlDict functions {{ }}:  #include \"{entry_name}\"")
+    if placeholders:
+        print(c("Edit these placeholders before running: ", "1;31") + " ".join(placeholders),
+              file=sys.stderr)
+
+
+def insert_include(cdict, entry_name):
+    if not cdict.is_file():
+        sys.exit(f"Error: {cdict} not found")
+    text = read_text(cdict)
+    inc = f'#include "{entry_name}"'
+    if inc in text:
+        print(f"{cdict.name} already contains {inc}")
+        return
+    bak = cdict.with_name(cdict.name + ".bak")
+    if not bak.exists():  # keep the oldest (original) backup
+        shutil.copy2(cdict, bak)
+    lines = text.splitlines()
+    start = None
+    for i, l in enumerate(lines):
+        if re.match(r"^functions\b", l):
+            start = i
+            break
+    if start is not None:
+        blk = None
+        for j in range(start, min(start + 3, len(lines))):
+            if "{" in lines[j]:
+                depth = 0
+                for k in range(j, len(lines)):
+                    s = re.sub(r"//.*", "", lines[k])
+                    depth += s.count("{") - s.count("}")
+                    if depth == 0:
+                        blk = k
+                        break
+                break
+        if blk is None:
+            sys.exit("Error: could not parse the functions block; edit controlDict manually")
+        if lines[blk].strip() == "}":
+            lines.insert(blk, "    " + inc)
+        else:
+            idx = lines[blk].rfind("}")
+            lines[blk] = lines[blk][:idx] + inc + " " + lines[blk][idx:]
+    else:
+        tail = None
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].startswith("// *****"):
+                tail = i
+                break
+        new = ["functions", "{", "    " + inc, "}", ""]
+        if tail is None:
+            lines += [""] + new
+        else:
+            lines[tail:tail] = new
+    cdict.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Inserted {inc} into {cdict} (backup: {cdict.name}.bak)")
+
+
+# ---------------------------------------------------------------------------
+# HTML catalog
+# ---------------------------------------------------------------------------
+
+def cmd_html(args):
+    db = load_db()
+    if not HTML_TEMPLATE.is_file():
+        sys.exit(f"Error: template {HTML_TEMPLATE} not found")
+    slim = dict(db)
+    data = json.dumps(slim, ensure_ascii=False).replace("</", "<\\/")
+    page = read_text(HTML_TEMPLATE).replace("/*__FO_DATA__*/null", data)
+    out = Path(args.output) if args.output else HTML_FILE
+    out.write_text(page, encoding="utf-8")
+    print(f"Wrote {out}")
+
+
+# ---------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(prog="foamFO", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("build", help="scan OpenFOAM sources and build the database")
+    s.add_argument("--src", help="OpenFOAM source root (default: $WM_PROJECT_DIR)")
+    s.add_argument("-o", "--output",
+                   help="database file (default: ~/.local/share/foamFO/foDatabase-<version>.json)")
+    s.add_argument("-v", "--verbose", action="store_true")
+    s.set_defaults(func=cmd_build)
+
+    s = sub.add_parser("list", help="list function objects")
+    s.add_argument("-g", "--group", help="filter by group (e.g. field, forces, utilities)")
+    s.add_argument("--groups", action="store_true", help="list groups with counts")
+    s.add_argument("-a", "--all", action="store_true", help="include lagrangian cloud functions")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("search", help="search names/descriptions (all keywords must match)")
+    s.add_argument("keywords", nargs="+")
+    s.add_argument("-a", "--all", action="store_true", help="include lagrangian cloud functions")
+    s.set_defaults(func=cmd_search)
+
+    s = sub.add_parser("show", help="show documentation of a function object")
+    s.add_argument("name")
+    s.add_argument("-i", "--inherited", action="store_true", help="also show inherited entries")
+    s.add_argument("--more", action="store_true", help="show additional header examples")
+    s.add_argument("-m", "--max", type=int, default=8, help="max tutorial paths to list")
+    s.set_defaults(func=cmd_show)
+
+    s = sub.add_parser("example", help="print usage blocks taken from the tutorials")
+    s.add_argument("name")
+    s.add_argument("-m", "--max", type=int, default=3)
+    s.add_argument("--src", help="OpenFOAM source root (default: $WM_PROJECT_DIR)")
+    s.set_defaults(func=cmd_example)
+
+    s = sub.add_parser("add", help="write an entry file into <case>/system")
+    s.add_argument("name")
+    s.add_argument("-case", "--case", default=".", help="case directory (default: cwd)")
+    s.add_argument("-n", "--entry", help="entry/file name (default: <name>1)")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--minimal", action="store_true", help="mandatory entries only (default)")
+    g.add_argument("--full", action="store_true", help="also list optional entries as comments")
+    s.add_argument("--insert", action="store_true",
+                   help="add #include into controlDict functions{} (backup .bak)")
+    s.add_argument("--stdout", action="store_true", help="print instead of writing a file")
+    s.add_argument("-f", "--force", action="store_true", help="overwrite existing file")
+    s.set_defaults(func=cmd_add)
+
+    s = sub.add_parser("html", help="generate catalog.html")
+    s.add_argument("-o", "--output")
+    s.set_defaults(func=cmd_html)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except BrokenPipeError:
+        pass
+
+
+if __name__ == "__main__":
+    main()
